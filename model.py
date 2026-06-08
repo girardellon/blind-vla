@@ -4,10 +4,16 @@ model.py — Tactile-to-Visual Projection Head (f_theta)
 This module implements the cross-modal architecture for projecting high-dimensional 
 tactile signals into the visual latent space of a Vision-Language-Action (VLA) policy.
 
+Input Strategy — Option B (Channel Concatenation):
+  digit_left.png and digit_right.png are concatenated channel-wise into a single
+  (B, 6, H, W) tensor before being fed to the encoder. A trainable 1×1 Conv2d
+  channel adapter maps 6 → 3 channels, bridging the dual-finger input to the
+  3-channel input distribution expected by the frozen TVL ViT-Small backbone.
+  The adapter is the only component of TactileEncoder that is NOT frozen.
+
 Architecture Overview:
-  1. TactileEncoder  : Wraps a frozen Vision Transformer (ViT-Small) pre-trained 
-                       by TVL, automatically fetched from HuggingFace Hub.
-                       Input  : (B, C, H_t, W_t) RGB tactile images normalized in [0, 1].
+  1. TactileEncoder  : Trainable channel adapter (Conv2d 6→3) + frozen TVL ViT-Small.
+                       Input  : (B, 6, H_t, W_t) — concatenated left+right DIGIT frames.
                        Output : z_T ∈ R^512 (Global [CLS] embedding).
   2. ProjectionHead  : The trainable mapping network (f_theta) that bridges modalities.
                        Input  : z_T ∈ R^512.
@@ -29,6 +35,8 @@ from torchvision import transforms
 #  ARCHITECTURE CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
+C_IN      = 6      # Input channels: digit_left (3) + digit_right (3) concatenated channel-wise
+                   # Change to 3 to revert to single-finger input (Option A baseline)
 D_TACTILE = 512    # Dimensionality of the TVL ViT-Small global embedding [CLS]
                    # (ViT-Base → 768, ViT-Tiny → 192)
 D_HIDDEN  = 1024   # Intermediate hidden dimension for the projection head f_theta
@@ -130,33 +138,59 @@ def _load_state_dict_robust(checkpoint_path: str) -> dict:
 
 class TactileEncoder(nn.Module):
     """
-    Tactile feature extractor built upon the pre-trained TVL ViT-Small backbone.
+    Tactile feature extractor for dual-finger input (Option B: channel concatenation).
 
-    During initialization, the network synchronizes weights from the remote hub,
-    instantiates the vision transformer architecture, and explicitly isolates its 
-    parameters from the backpropagation graph.
+    Input Strategy:
+    ───────────────
+    digit_left.png and digit_right.png are stacked channel-wise into a (B, 6, H, W)
+    tensor upstream (in the Dataset). This encoder maps that dual-finger signal to
+    the frozen TVL ViT-Small backbone via a trainable 1×1 channel adapter.
 
-    Methodological Rationalization for Stage 2 Freezing:
-    ────────────────────────────────────────────────────
-    The TVL ViT has been pre-aligned with contrastive image-text latent spaces specifically 
-    for DIGIT tactile frames. Jointly optimizing the encoder with the projection head f_theta 
-    couples two separate problems: tactile feature representation learning and cross-modal 
-    latent manifold projection. Keeping the encoder frozen decouples these phenomena, ensuring 
-    numerical stability. Full fine-tuning may be unlocked if target cosine thresholds 
-    are not achieved.
+    Sub-module Freeze Policy:
+    ─────────────────────────
+    • channel_adapter  [TRAINABLE] — Conv2d(6→3, kernel=1, bias=False).
+      This lightweight adapter is the only trainable component inside TactileEncoder.
+      It learns to fuse left+right finger information into the 3-channel distribution
+      expected by the pre-trained ViT, without disturbing its frozen weights.
+      Parameter count: 6 × 3 = 18 scalar weights (negligible).
 
-    Input  Dimensions: (B, C, H, W) float32 tensor scaled to interval [0, 1].
+    • vit              [FROZEN]    — TVL ViT-Small pre-trained on DIGIT tactile frames.
+      Kept frozen for the same reasons as the original single-finger design: the TVL
+      contrastive alignment is best preserved by isolating encoder representation
+      learning from the cross-modal projection objective.
+
+    Input  Dimensions: (B, 6, H, W) float32 tensor scaled to interval [0, 1].
     Output Dimensions: (B, 512) float32 tensor representing tactile latent z_T.
     """
 
-    def __init__(self, cache_dir: str = "./hf_cache"):
+    def __init__(self, cache_dir: str = "./hf_cache", c_in: int = C_IN):
         super().__init__()
 
-        # Synchronize model weights using local cache or remote retrieval
+        # ── Channel Adapter (Trainable) ───────────────────────────────
+        # Maps c_in channels (default 6) → 3 channels expected by the ViT.
+        # kernel_size=1 performs a per-pixel learned linear combination across
+        # the channel dimension — no spatial mixing, minimal parameter overhead.
+        # bias=False: the downstream LayerNorm inside the ViT handles centering.
+        self.channel_adapter = nn.Conv2d(
+            in_channels  = c_in,
+            out_channels = 3,
+            kernel_size  = 1,
+            bias         = False,
+        )
+        # Initialize as near-identity: each output channel averages the two
+        # corresponding fingers. For c_in=6, left=[:3], right=[3:].
+        # This gives a sensible starting point rather than pure random noise.
+        with torch.no_grad():
+            w = torch.zeros(3, c_in, 1, 1)
+            for i in range(3):
+                w[i, i,     0, 0] = 0.5   # left finger, channel i
+                w[i, i + 3, 0, 0] = 0.5   # right finger, channel i
+            self.channel_adapter.weight.copy_(w)
+        # channel_adapter.requires_grad = True by default (nn.Conv2d default)
+
+        # ── Frozen TVL ViT-Small Backbone ─────────────────────────────
         checkpoint_path = download_tvl_checkpoint(cache_dir)
 
-        # Instantiate a Vision Transformer architecture using the 'timm' registry
-        # Setting num_classes=0 isolates the global [CLS] token pooling layer (512-dim output)
         try:
             import timm
         except ImportError:
@@ -167,16 +201,12 @@ class TactileEncoder(nn.Module):
 
         self.vit = timm.create_model(
             "vit_small_patch16_224",
-            pretrained=False,   # Disable ImageNet weights to ingest target TVL parameters
-            num_classes=0,      # Isolates the global pooled embedding output
+            pretrained=False,
+            num_classes=0,
         )
 
-        # Load optimized TVL state dictionary
         state_dict = _load_state_dict_robust(checkpoint_path)
-
         missing, unexpected = self.vit.load_state_dict(state_dict, strict=False)
-        # strict=False accommodates deliberate mismatches, such as the exclusion
-        # of classification heads or specific TVL contrastive projectors.
         print(f"  TVL ViT-Small configuration parsed.")
         print(f"  Missing parameters    : {len(missing)}  {missing[:3] if missing else ''}")
         print(f"  Unexpected parameters : {len(unexpected)}  {unexpected[:3] if unexpected else ''}")
@@ -184,13 +214,12 @@ class TactileEncoder(nn.Module):
             print("  CRITICAL WARNING: Essential backbone layers are missing from the state dict."
                   " Verify checkpoint compatibility with tvl_enc_vits.pth.")
 
-        # Explicitly decouple backbone parameters from gradient computation graph
+        # Freeze all ViT parameters
         for param in self.vit.parameters():
             param.requires_grad = False
-        self.vit.eval()   # Enforces evaluation mode (disables dropout/batch normalization)
+        self.vit.eval()
 
-        # Standard ImageNet pre-processing pipeline matching pre-training distribution
-        # Dynamic resizing is enforced to allow flexible downstream input configurations.
+        # Standard ImageNet normalization applied AFTER channel adaptation
         self.preprocess = transforms.Compose([
             transforms.Resize((224, 224), antialias=True),
             transforms.Normalize(
@@ -201,17 +230,22 @@ class TactileEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Executes a deterministic forward pass through the frozen tactile encoder.
+        Executes forward pass: channel adaptation → normalization → frozen ViT.
 
         Args:
-            x (torch.Tensor): Raw image tensor of shape (B, C, H, W) in [0, 1].
+            x (torch.Tensor): Dual-finger tensor of shape (B, 6, H, W) in [0, 1].
+                              Channels: [left_R, left_G, left_B, right_R, right_G, right_B].
 
         Returns:
             torch.Tensor: Global feature embedding z_T of shape (B, 512).
         """
+        # channel_adapter runs with gradients (trainable)
+        x   = self.channel_adapter(x)     # (B, 6, H, W) → (B, 3, H, W)
+
+        # ViT runs without gradients (frozen)
         with torch.no_grad():
-            x   = self.preprocess(x)   # Output shape: (B, 3, 224, 224)
-            z_T = self.vit(x)          # Output shape: (B, 512)
+            x   = self.preprocess(x)      # resize + normalize → (B, 3, 224, 224)
+            z_T = self.vit(x)             # (B, 512)
         return z_T
 
 
@@ -301,24 +335,33 @@ class ProjectionHead(nn.Module):
 
 class TactileProjector(nn.Module):
     """
-    Unified entry point mapping raw tactile inputs directly to target visual latents.
+    Unified entry point mapping raw dual-finger tactile inputs to target visual latents.
 
-    Encapsulates both the frozen feature extractor and the trainable multi-layer 
-    projection mapping network.
+    Input convention (Option B — channel concatenation):
+        tactile_images : (B, 6, H, W) float32 in [0, 1]
+                         Channels 0-2 = digit_left  (R, G, B)
+                         Channels 3-5 = digit_right (R, G, B)
+
+    Trainable components:
+        • tactile_encoder.channel_adapter  — Conv2d(6→3, 1×1), 18 parameters
+        • projection_head                  — MLP(512→1024→1024→2176)
+
+    Frozen components:
+        • tactile_encoder.vit              — TVL ViT-Small (~21M parameters)
 
     Standard Training Pipeline Integration:
     ──────────────────────────────────────
         projector = TactileProjector(cache_dir="./hf_cache")
 
-        # Explicitly isolate the optimizer to trainable parameters only:
         optimizer = torch.optim.AdamW(
             projector.trainable_parameters(), lr=1e-4
         )
 
-        # Forward execution and parameter update:
-        z_V_hat = projector(tactile_images)   # Output shape: (B, 2176)
+        # Concatenate left and right finger images before passing in:
+        tactile = torch.cat([digit_left, digit_right], dim=1)  # (B, 6, H, W)
+        z_V_hat = projector(tactile)   # (B, 2176)
         loss, _ = criterion(z_V_hat, z_V_cached)
-        loss.backward()                       # Propagates gradients exclusively to f_theta
+        loss.backward()
         optimizer.step()
     """
 
@@ -329,38 +372,37 @@ class TactileProjector(nn.Module):
 
     def forward(self, tactile_images: torch.Tensor) -> torch.Tensor:
         """
-        Processes tactile frames to extract and project cross-modal embeddings.
-
         Args:
-            tactile_images (torch.Tensor): Normalized input images of shape (B, C, H, W).
+            tactile_images (torch.Tensor): Shape (B, 6, H, W) — left+right concatenated.
 
         Returns:
-            torch.Tensor: Predicted OpenVLA-compatible features z_V_hat of shape (B, 2176).
+            torch.Tensor: z_V_hat of shape (B, 2176).
         """
-        z_T     = self.tactile_encoder(tactile_images)   # Executed under frozen evaluation mode
-        z_V_hat = self.projection_head(z_T)              # Tracks and propagates gradients
+        z_T     = self.tactile_encoder(tactile_images)
+        z_V_hat = self.projection_head(z_T)
         return z_V_hat
 
     def trainable_parameters(self):
         """
-        Isolates parameters tracking gradients to protect frozen modules.
+        Returns parameters that should receive gradient updates:
+          - channel_adapter weights (inside tactile_encoder)
+          - all projection_head weights
 
-        Returns:
-            generator: Generator expression containing parameters belonging exclusively to f_theta.
+        The frozen ViT parameters are excluded.
         """
-        return self.projection_head.parameters()
+        return (
+            list(self.tactile_encoder.channel_adapter.parameters())
+            + list(self.projection_head.parameters())
+        )
 
     def count_parameters(self) -> dict:
-        """
-        Computes the module network parameter distribution profile.
-
-        Returns:
-            dict: Quantified analysis of trainable vs. frozen network parameters.
-        """
-        trainable = sum(p.numel() for p in self.projection_head.parameters())
-        frozen    = sum(p.numel() for p in self.tactile_encoder.parameters())
+        adapter_params    = sum(p.numel() for p in self.tactile_encoder.channel_adapter.parameters())
+        head_params       = sum(p.numel() for p in self.projection_head.parameters())
+        vit_frozen_params = sum(p.numel() for p in self.tactile_encoder.vit.parameters())
         return {
-            "projection_head_trainable": trainable,
-            "tactile_encoder_frozen":    frozen,
-            "total":                     trainable + frozen,
+            "channel_adapter_trainable":   adapter_params,
+            "projection_head_trainable":   head_params,
+            "total_trainable":             adapter_params + head_params,
+            "tactile_encoder_vit_frozen":  vit_frozen_params,
+            "total":                       adapter_params + head_params + vit_frozen_params,
         }

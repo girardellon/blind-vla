@@ -1,5 +1,28 @@
+
+Nessun elemento selezionato
+
+Vai ai contenuti
+Utilizzo di Posta di Università degli studi di Padova con gli screen reader
+1 di 1.445
+codice blind-vla
+Posta in arrivo
+Nicolo' Girardello <nicolo.girardello@studenti.unipd.it>
+	
+Allegati11:08 (1 ora fa)
+	
+	
+a me
+
+ 4 allegati
+  •  Scansionato da Gmail
+
 """
 train.py — Automated Integrity Verification & Alignment Training Loop (Stage 2)
+
+Input Strategy: Option B (Channel Concatenation)
+  digit_left.png and digit_right.png are concatenated channel-wise into a single
+  (B, 6, H, W) tensor. The Dataset returns this fused tensor; the model handles
+  the 6→3 channel projection internally via the trainable channel_adapter.
 
 This script serves a dual operational purpose within the training pipeline:
   1. Automated Architecture Verification (run_sanity_check): Executes a deterministic
@@ -14,7 +37,7 @@ Execution Paradigms:
       python -m src.training.train --mode sanity
 
   # Production Alignment Training (Requires pre-computed Stage 1 visual cache):
-      python -m src.training.train --mode train --data_dir /path/to/dataset --tvl_ckpt /path/to/tvl.pth
+      python -m src.training.train --mode train --data_dir /path/to/dataset --tvl_ckpt /path/to/hf_cache
 """
 
 import argparse
@@ -34,23 +57,23 @@ from src.training.loss import FeatureAlignmentLoss, compute_alignment_metrics
 
 class TactileVisualDataset(Dataset):
     """
-    Implements a highly optimized pipeline for ingesting synchronized multi-modal pairs:
-    (Tactile Image, Cached Visual Embedding).
+    Ingestion pipeline for synchronized multi-modal pairs: (Dual-Finger Tactile, Visual Embedding).
 
-    Downstream Production Specifications:
-      - tactile_images : RGB observation frames derived from the DIGIT sensor mesh.
-                         Shape: (C, H, W) = (3, 224, 224), float32 tensor in [0, 1].
-      - z_V_cached     : Static visual feature representations pre-computed using a 
-                         frozen OpenVLA-7B encoder during Stage 1 operations.
-                         Shape: (D_VISUAL,) = (2176,).
+    Input Strategy — Option B (Channel Concatenation):
+      Each .pt file contains both digit_left and digit_right as separate (3, 224, 224)
+      tensors. This Dataset concatenates them channel-wise at load time, producing a
+      single (6, 224, 224) tensor that is passed directly to the TactileProjector.
 
-    Methodological Rationalization for Visual Latent Caching:
-    ─────────────────────────────────────────────────────────
-    The OpenVLA model encompasses 7.5B parameters, introducing severe VRAM footprint constraints 
-    that prevent concurrent instantiation with the projection mapping layers on standard hardware. 
-    Pre-computing and caching the target representations z_V onto persistent storage decouples 
-    the optimization routine, transforming training into an isolated mapping operation between 
-    f_theta and highly lightweight tensor structures.
+    Expected .pt file structure:
+      {
+        "digit_left"  : Tensor (3, 224, 224), float32, [0, 1]   ← left finger DIGIT frame
+        "digit_right" : Tensor (3, 224, 224), float32, [0, 1]   ← right finger DIGIT frame
+        "z_V"         : Tensor (2176,),       float32           ← cached OpenVLA visual embedding
+      }
+
+    Returned batch item:
+      - tactile_concat : (6, 224, 224) — channels [left_R, left_G, left_B, right_R, right_G, right_B]
+      - z_V            : (2176,)
     """
 
     def __init__(self, data_dir: str):
@@ -63,20 +86,21 @@ class TactileVisualDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample = torch.load(self.samples[idx], map_location="cpu")
-        # Every verified storage payload contains a structural dictionary mapping:
-        #   "tactile_image" : Tensor shape (3, 224, 224), float32 interval [0, 1]
-        #   "z_V"           : Tensor shape (2176,), float32 unbounded projection
-        return sample["tactile_image"], sample["z_V"]
+        sample = torch.load(self.samples[idx], map_location="cpu", weights_only=True)
+        digit_left  = sample["digit_left"]    # (3, 224, 224)
+        digit_right = sample["digit_right"]   # (3, 224, 224)
+        z_V         = sample["z_V"].float()   # (2176,)
+        # Concatenate along channel dim → (6, 224, 224)
+        tactile_concat = torch.cat([digit_left, digit_right], dim=0)
+        return tactile_concat, z_V
 
 
 class SyntheticDataset(Dataset):
     """
-    Generates isolated, pseudo-random tensors mimicking production shapes.
-    
-    This module lacks any semantic representation and is exclusively utilized during 
-    architectural sanity checks to verify tensor propagation, data dimensions, 
-    and multi-gpu memory allocation safety mechanisms.
+    Generates pseudo-random tensors mimicking Option B production shapes.
+
+    Exclusively used during architectural sanity checks.
+    tactile shape: (6, 224, 224) — left+right DIGIT frames concatenated channel-wise.
     """
     def __init__(self, n_samples: int = 128):
         self.n = n_samples
@@ -85,8 +109,8 @@ class SyntheticDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx):
-        tactile = torch.rand(3, 224, 224)   # Synthesized raw image observation
-        z_V     = torch.randn(D_VISUAL)     # Synthesized target visual latent token
+        tactile = torch.rand(6, 224, 224)   # 6 channels: 3 left + 3 right
+        z_V     = torch.randn(D_VISUAL)
         return tactile, z_V
 
 
@@ -100,73 +124,83 @@ def run_sanity_check():
 
       [1] Tensor Shape Topology : Validates structural dimension invariance along the network.
       [2] Numerical Stability   : Discovers undefined values (NaN) or infinity exceptions (Inf).
-      [3] Gradient Propagation  : Verifies backward paths reach backpropagation entry layers.
-      [4] Parametric Isolation  : Enforces frozen weight security within the TactileEncoder.
-      [5] Parameter Update Loop : Confirms optimization step updates target projection weights.
+      [3] Gradient Propagation  : Verifies backward paths reach both channel_adapter AND
+                                  projection_head (both must receive gradients).
+      [4] Parametric Isolation  : Enforces frozen weight security within the TVL ViT backbone.
+      [5] Parameter Update Loop : Confirms optimizer step updates all trainable parameters.
 
     Any deviation from the constraints defined in this procedure triggers immediate execution 
     termination to prevent unviable resource usage.
     """
     print("=" * 60)
-    print("INTEGRITY VERIFICATION — Synthetic Telemetry (Bypassing Checkpoints)")
+    print("INTEGRITY VERIFICATION — Synthetic Telemetry (Option B: 6-channel input)")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Target Execution Device: {device}\n")
 
-    # Instantiate model using un-initialized weights to focus exclusively on computational mechanics
     projector = _build_projector_no_checkpoint().to(device)
     projector.train()
 
     criterion = FeatureAlignmentLoss(lambda_cos=1.0)
     optimizer = optim.AdamW(projector.trainable_parameters(), lr=1e-4)
 
-    # Synthesized evaluation batch parameters
     B = 8
-    tactile_images = torch.rand(B, 3, 224, 224).to(device)
+    # Option B: 6-channel input — 3 channels left finger + 3 channels right finger
+    tactile_images = torch.rand(B, 6, 224, 224).to(device)
     z_V_target     = torch.randn(B, D_VISUAL).to(device)
 
-    # ── [1] Forward Pass Propagation Verification ────────────────────
+    # ── [1] Forward Pass Shape Verification ──────────────────────
     z_V_hat = projector(tactile_images)
     assert z_V_hat.shape == (B, D_VISUAL), \
-        f"Structural Mismatch Exception: Expected ({B}, {D_VISUAL}), intercepted {z_V_hat.shape}"
+        f"Shape mismatch: expected ({B}, {D_VISUAL}), got {z_V_hat.shape}"
     print(f"[1] Output Space Dimension Interface : {z_V_hat.shape}  ✓")
 
-    # ── [2] Objective Function Numerical Verification ────────────────
+    # ── [2] Numerical Stability Verification ─────────────────────
     loss, info = criterion(z_V_hat, z_V_target)
     assert not torch.isnan(loss) and not torch.isinf(loss), \
-        f"Numerical Instability Exception: Objective yielded out-of-bounds value {loss.item()}"
+        f"Numerical instability: loss={loss.item()}"
     print(f"[2] Baseline Multi-Objective Scalar  : {loss.item():.4f}  ✓")
     print(f"    MSE Component: {info['loss_mse']:.4f}  |  Angular Component: {info['loss_cosine']:.4f}")
 
-    # ── [3] Trainable Sub-Graph Gradient Tracking Verification ────────
+    # ── [3] Gradient Flow Verification ───────────────────────────
     optimizer.zero_grad()
     loss.backward()
 
-    # Verify that structural optimization paths are actively propagating derivatives
-    has_grad = any(
+    adapter_has_grad = any(
+        p.grad is not None and p.grad.abs().sum() > 0
+        for p in projector.tactile_encoder.channel_adapter.parameters()
+    )
+    head_has_grad = any(
         p.grad is not None and p.grad.abs().sum() > 0
         for p in projector.projection_head.parameters()
     )
-    assert has_grad, "Gradient Routing Failure: Trainable projection layers isolated from backward pass."
-    print(f"[3] Trainable Mapping Derivative Flow: Verified Active  ✓")
+    assert adapter_has_grad, "Gradient failure: channel_adapter did not receive gradients."
+    assert head_has_grad,    "Gradient failure: projection_head did not receive gradients."
+    print(f"[3] Gradient Flow — channel_adapter  : Active  ✓")
+    print(f"    Gradient Flow — projection_head  : Active  ✓")
 
-    # ── [4] Frozen Sub-Graph Isolation Verification ──────────────────
-    no_grad_encoder = all(
+    # ── [4] ViT Backbone Freeze Verification ─────────────────────
+    vit_no_grad = all(
         p.grad is None or p.grad.abs().sum() == 0
-        for p in projector.tactile_encoder.parameters()
+        for p in projector.tactile_encoder.vit.parameters()
     )
-    assert no_grad_encoder, "Isolation Failure: Frozen backbone state mutated by backpropagation graph."
-    print(f"[4] Backbone Parameter Freeze State  : Secure Isolation  ✓")
+    assert vit_no_grad, "Isolation failure: frozen ViT backbone received gradient updates."
+    print(f"[4] ViT Backbone Freeze State        : Secure  ✓")
 
-    # ── [5] Numerical Optimizer Step Verification ────────────────────
-    weights_before = projector.projection_head.net[0].weight.data.clone()
+    # ── [5] Optimizer Step Verification ──────────────────────────
+    adapter_w_before = projector.tactile_encoder.channel_adapter.weight.data.clone()
+    head_w_before    = projector.projection_head.net[0].weight.data.clone()
     optimizer.step()
-    weights_after  = projector.projection_head.net[0].weight.data
+    assert not torch.allclose(adapter_w_before, projector.tactile_encoder.channel_adapter.weight.data), \
+        "Optimizer failure: channel_adapter weights did not update."
+    assert not torch.allclose(head_w_before, projector.projection_head.net[0].weight.data), \
+        "Optimizer failure: projection_head weights did not update."
+    print(f"[5] Parameter Update — channel_adapter: Updated  ✓")
+    print(f"    Parameter Update — projection_head : Updated  ✓")
 
-    changed = not torch.allclose(weights_before, weights_after)
-    assert changed, "Optimization Failure: Weight delta remains static after parameter updates."
-    print(f"[5] Numerical Parameter Adaptation   : Operational  ✓")
+    print("\nINTEGRITY VERIFICATION SUCCESSFUL — Option B pipeline structurally viable.")
+    print("=" * 60)
 
     print("\nINTEGRITY VERIFICATION SUCCESSFUL — Network pipeline structurally viable.")
     print("=" * 60)
@@ -174,46 +208,67 @@ def run_sanity_check():
 
 def _build_projector_no_checkpoint():
     """
-    Architectural factory mock utility. Instantiates the computational graphs 
-    without initiating high-latency I/O operations from external parameter caches.
+    Mock projector for sanity checks — mirrors the Option B TactileProjector architecture
+    without downloading the TVL checkpoint.
+
+    Includes a trainable channel_adapter (Conv2d 6→3) and a frozen random-weight ViT,
+    matching the exact attribute names used by run_sanity_check.
     """
-    from src.models.model import ProjectionHead
+    from src.models.model import ProjectionHead, C_IN
     import torch.nn as nn
+    from torchvision import transforms
+
+    class _MockTactileEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            import timm
+
+            # Trainable channel adapter: 6→3, same init as production TactileEncoder
+            self.channel_adapter = nn.Conv2d(C_IN, 3, kernel_size=1, bias=False)
+            with torch.no_grad():
+                w = torch.zeros(3, C_IN, 1, 1)
+                for i in range(3):
+                    w[i, i,     0, 0] = 0.5
+                    w[i, i + 3, 0, 0] = 0.5
+                self.channel_adapter.weight.copy_(w)
+            # channel_adapter is trainable by default
+
+            # Frozen random-weight ViT (no TVL checkpoint download)
+            self.vit = timm.create_model("vit_small_patch16_224", pretrained=False, num_classes=0)
+            for p in self.vit.parameters():
+                p.requires_grad = False
+            self.vit.eval()
+
+            self._normalize = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std =[0.229, 0.224, 0.225],
+            )
+
+        def forward(self, x):
+            # channel_adapter: trainable, runs with gradient
+            x = self.channel_adapter(x)          # (B, 6, H, W) → (B, 3, H, W)
+            # ViT: frozen, no gradient
+            with torch.no_grad():
+                x = torch.nn.functional.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+                x = self._normalize(x)
+                z_T = self.vit(x)                # (B, 512)
+            return z_T
 
     class MockProjector(nn.Module):
         def __init__(self):
             super().__init__()
-            import timm
-            vit = timm.create_model("vit_small_patch16_224", pretrained=False, num_classes=0)
-            for p in vit.parameters():
-                p.requires_grad = False
-
-            self.tactile_encoder = nn.Sequential(vit)
-
-            class _FrozenWrapper(nn.Module):
-                def __init__(self, vit):
-                    super().__init__()
-                    self.vit = vit
-                def forward(self, x):
-                    from torchvision import transforms
-                    x = transforms.functional.resize(x, [224, 224])
-                    mean = torch.tensor([0.485,0.456,0.406]).view(1,3,1,1).to(x.device)
-                    std  = torch.tensor([0.229,0.224,0.225]).view(1,3,1,1).to(x.device)
-                    x = (x - mean) / std
-                    return self.vit(x)
-                def parameters(self, recurse=True):
-                    return self.vit.parameters(recurse)
-
-            self.tactile_encoder = _FrozenWrapper(vit)
+            self.tactile_encoder = _MockTactileEncoder()
             self.projection_head = ProjectionHead()
 
         def forward(self, x):
-            with torch.no_grad():
-                z_T = self.tactile_encoder(x)
+            z_T = self.tactile_encoder(x)
             return self.projection_head(z_T)
 
         def trainable_parameters(self):
-            return self.projection_head.parameters()
+            return (
+                list(self.tactile_encoder.channel_adapter.parameters())
+                + list(self.projection_head.parameters())
+            )
 
     return MockProjector()
 
@@ -258,7 +313,7 @@ def train(
     print(f"Manifold Cohort Strategy: Allocate {n_train} steps to training, {n_val} to validation.")
 
     # ── Model Instantiation ──────────────────────────────────────────
-    projector = TactileProjector(tvl_ckpt).to(device)
+    projector = TactileProjector(cache_dir=tvl_ckpt).to(device)
     projector.train()
 
     # ── Loss Formulations & Optimization Routines ────────────────────
@@ -269,8 +324,9 @@ def train(
 
     # Dynamic Learning Rate Scheduling: Reduces scale when evaluation saturation occurs
     # Monitored parameter tracking patience constraint defined as a 5-epoch envelope
+    # verbose=False: deprecated in PyTorch >=2.2; LR changes are logged manually below
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, verbose=True
+        optimizer, mode="min", factor=0.5, patience=5, verbose=False
     )
 
     best_cos_sim = -1.0   # Baseline threshold for tracking optimal structural checkpoints
@@ -337,20 +393,36 @@ def train(
               f"Val MSE {val_mse:.4f} | Val NormErr {val_nrm:.4f}")
 
         # Execute optimization learning rate reduction pass using Mean Squared Error criteria
+        prev_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_mse)
+        curr_lr = optimizer.param_groups[0]["lr"]
+        if curr_lr < prev_lr:
+            print(f"  -> LR reduced: {prev_lr:.2e} → {curr_lr:.2e}")
 
         # ── PERSISTENCE ENGINE ───────────────────────────────────────
+        # Save both channel_adapter and projection_head so the full trainable
+        # state can be restored without re-running the frozen encoder.
         if val_cos > best_cos_sim:
             best_cos_sim = val_cos
             torch.save(
-                projector.projection_head.state_dict(),
+                {
+                    "channel_adapter": projector.tactile_encoder.channel_adapter.state_dict(),
+                    "projection_head": projector.projection_head.state_dict(),
+                    "epoch":           epoch,
+                    "val_cos_sim":     val_cos,
+                },
                 f"{output_dir}/best_projection_head.pth"
             )
-            print(f"  -> Optimal alignment boundary verified (Validation Cosine Similarity: {val_cos:.4f})")
+            print(f"  -> New best checkpoint (Val CosSim: {val_cos:.4f})")
 
         if epoch % save_every == 0:
             torch.save(
-                projector.projection_head.state_dict(),
+                {
+                    "channel_adapter": projector.tactile_encoder.channel_adapter.state_dict(),
+                    "projection_head": projector.projection_head.state_dict(),
+                    "epoch":           epoch,
+                    "val_cos_sim":     val_cos,
+                },
                 f"{output_dir}/projection_head_epoch{epoch:03d}.pth"
             )
 
