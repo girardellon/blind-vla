@@ -42,11 +42,20 @@ This repository evaluates three progressive soft-gating architectures:
 
 ## 3. Architecture & Data Flow
 
-<p align="center">
-  <img src="assets/architecture_alignment.png" alt="Blind-VLA Cross-Modal Alignment Architecture" width="90%">
-</p>
+<table align="center" style="border: none; border-collapse: collapse;">
+  <tr style="border: none;">
+    <td align="center" style="border: none; padding: 10px; width: 50%; vertical-align: top;">
+      <img src="assets/training_architecture.png" alt="Phase 2: Training Phase" width="100%">
+      <br><br><b>(a) Training Phase (Alignment)</b>
+    </td>
+    <td align="center" style="border: none; padding: 10px; width: 50%; vertical-align: top;">
+      <img src="assets/inference_architecture.png" alt="Phase 3: Inference Phase" width="100%">
+      <br><br><b>(b) Inference Phase (Gating)</b>
+    </td>
+  </tr>
+</table>
 
-> **Figure 1:** Cross-modal alignment pipeline. The tactile branch passes the optical tactile tensor $X_T$ through a frozen TVL ViT-Small encoder and a trainable residual MLP projection head $f_\theta$ to produce the projected visual target $\hat{z}_V$. The primary visual branch processes the wrist-camera image $X_V$ through the frozen OpenVLA SigLIP+DINOv2 vision backbone, followed by spatial average pooling to compute the target embedding $\bar{z}_V$. Both representations are aligned in the continuous latent space via a hybrid MSE and cosine similarity objective. During inference under visual degradation or blackout, the dynamic gating mechanism bypasses or complements the corrupted visual stream using the aligned tactile embedding $\hat{z}_V$ to drive the frozen autoregressive Llama-2 7B policy network.
+> **Figure 1:** Cross-modal alignment pipeline. **(a) Phase 2: Cross-Modal Latent Alignment (Training phase).** The tactile branch passes the optical tactile tensor $X_T$ through a frozen TVL ViT-Small encoder and a trainable residual MLP projection head $f_\theta$ to produce the projected visual target $\hat{z}_V$. The primary visual branch processes the wrist-camera image $X_V$ through the frozen OpenVLA SigLIP+DINOv2 vision backbone, followed by spatial average pooling to compute the target embedding $\bar{z}_V$. Both representations are aligned in the continuous latent space via a hybrid MSE and cosine similarity objective. **(b) Phase 3: Dynamic Gating & Policy Execution (Inference phase).** During inference under visual degradation or blackout, the dynamic gating mechanism bypasses or complements the corrupted visual stream using the aligned tactile embedding $\hat{z}_V$ to drive the frozen autoregressive Llama-2 7B policy network.
 
 ---
 
