@@ -1,21 +1,4 @@
 
-Nessun elemento selezionato
-
-Vai ai contenuti
-Utilizzo di Posta di Università degli studi di Padova con gli screen reader
-1 di 1.445
-codice blind-vla
-Posta in arrivo
-Nicolo' Girardello <nicolo.girardello@studenti.unipd.it>
-	
-Allegati11:08 (1 ora fa)
-	
-	
-a me
-
- 4 allegati
-  •  Scansionato da Gmail
-
 """
 train.py — Automated Integrity Verification & Alignment Training Loop (Stage 2)
 
@@ -47,8 +30,8 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from pathlib import Path
 
 # Absolute package imports mapped across the repository topology
-from src.models.model import TactileProjector, D_VISUAL
-from src.training.loss import FeatureAlignmentLoss, compute_alignment_metrics
+from model import TactileProjector, D_VISUAL
+from loss import FeatureAlignmentLoss, compute_alignment_metrics
 
 
 # ─────────────────────────────────────────────────────────────
@@ -214,7 +197,7 @@ def _build_projector_no_checkpoint():
     Includes a trainable channel_adapter (Conv2d 6→3) and a frozen random-weight ViT,
     matching the exact attribute names used by run_sanity_check.
     """
-    from src.models.model import ProjectionHead, C_IN
+    from model import ProjectionHead, C_IN
     import torch.nn as nn
     from torchvision import transforms
 

@@ -37,7 +37,7 @@ from torchvision import transforms
 
 C_IN      = 6      # Input channels: digit_left (3) + digit_right (3) concatenated channel-wise
                    # Change to 3 to revert to single-finger input (Option A baseline)
-D_TACTILE = 512    # Dimensionality of the TVL ViT-Small global embedding [CLS]
+D_TACTILE = 384    # Dimensionality of the TVL ViT-Small global embedding [CLS]
                    # (ViT-Base → 768, ViT-Tiny → 192)
 D_HIDDEN  = 1024   # Intermediate hidden dimension for the projection head f_theta
 D_VISUAL  = 2176   # Target OpenVLA visual patch embedding dimension (Phase 1 verified)
@@ -206,6 +206,11 @@ class TactileEncoder(nn.Module):
         )
 
         state_dict = _load_state_dict_robust(checkpoint_path)
+        state_dict = {
+            k.replace("tactile_encoder.", ""): v
+            for k, v in state_dict.items()
+            if k.startswith("tactile_encoder.")
+        }
         missing, unexpected = self.vit.load_state_dict(state_dict, strict=False)
         print(f"  TVL ViT-Small configuration parsed.")
         print(f"  Missing parameters    : {len(missing)}  {missing[:3] if missing else ''}")
