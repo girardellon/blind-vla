@@ -43,70 +43,71 @@ def blackout(img):
     return np.zeros_like(img)
 
 
-def apply_curriculum(img):
-
-    p = random.random()
-
-    # 10% clean
-    if p < 0.10:
-        return img
-
-    # 20% light noise
-    elif p < 0.30:
-        return add_gaussian_noise(img, sigma=10)
-
-    # 20% noise + blur
-    elif p < 0.50:
-        img = add_gaussian_noise(img, sigma=20)
-        return add_blur(img, kernel=5)
-
-    # 20% strong blur
-    elif p < 0.70:
-        return add_blur(img, kernel=11)
-
-    # 15% occlusion
-    elif p < 0.85:
-        return add_occlusion(img, frac=0.30)
-
-    # 10% severe occlusion
-    elif p < 0.95:
-        return add_occlusion(img, frac=0.60)
-
-    # 5% complete failure
-    else:
-        return blackout(img)
+DEGRADATIONS = {
+    "type0": lambda x: x,
+    "type1": lambda x: add_gaussian_noise(x, sigma=10),
+    "type2": lambda x: add_blur(
+        add_gaussian_noise(x, sigma=20),
+        kernel=5,
+    ),
+    "type3": lambda x: add_blur(x, kernel=11),
+    "type4": lambda x: add_occlusion(x, frac=0.30),
+    "type5": lambda x: add_occlusion(x, frac=0.60),
+    "type6": blackout,
+}
 
 
-def build_dataset(input_dir, output_dir):
+def build_dataset(input_root, output_root):
 
-    input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
+    input_root = Path(input_root)
+    output_root = Path(output_root)
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    object_dirs = [d for d in input_root.iterdir() if d.is_dir()]
 
-    image_files = list(input_dir.glob("*"))
+    for obj_dir in object_dirs:
 
-    for f in tqdm(image_files):
+        object_name = obj_dir.name
 
-        img = cv2.imread(str(f))
+        out_obj_dir = output_root / object_name
+        out_obj_dir.mkdir(parents=True, exist_ok=True)
 
-        if img is None:
-            continue
-
-        corrupted = apply_curriculum(img)
-
-        cv2.imwrite(
-            str(output_dir / f.name),
-            corrupted
+        sample_dirs = sorted(
+            [d for d in obj_dir.iterdir() if d.is_dir()]
         )
+
+        for sample_dir in tqdm(
+            sample_dirs,
+            desc=f"{object_name}"
+        ):
+
+            img_path = sample_dir / "external.png"
+        
+            if not img_path.exists():
+                    continue
+
+            img = cv2.imread(str(img_path))
+
+            sample_name = sample_dir.name
+
+            for degr_name, degr_fn in DEGRADATIONS.items():
+
+                degraded = degr_fn(img)
+
+                save_name = (
+                    f"{object_name}_"
+                    f"{sample_name}_"
+                    f"{degr_name}.png"
+                )
+
+                cv2.imwrite(
+                    str(out_obj_dir / save_name),
+                    degraded
+                )
 
 
 if __name__ == "__main__":
 
     build_dataset(
-        "external_images",
+        "data_collection/dataset_version1",
         "external_images_corrupted"
     )
